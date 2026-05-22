@@ -1,7 +1,10 @@
 use dashmap::DashSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha512, digest};
-use std::path::{self, PathBuf};
+use std::{
+    path::{self, PathBuf},
+    sync::OnceLock,
+};
 
 /// Content hash of a file.
 pub type FileHash = digest::Output<Sha512>;
@@ -33,6 +36,14 @@ pub struct StoreDir {
     /// harmless since `create_dir_all` is idempotent.
     #[serde(skip, default)]
     ensured_shards: DashSet<u8>,
+
+    /// Memoised `<root>/v11/files` directory. Resolved lazily on the
+    /// first CAS path lookup and reused across every subsequent file
+    /// write — saves one `Path::join` allocation per file on the hot
+    /// path, ~170k on the alotta-files clean install. `OnceLock` so
+    /// initialization across rayon threads stays race-free.
+    #[serde(skip, default)]
+    cached_files_dir: OnceLock<PathBuf>,
 }
 
 /// Manual `PartialEq` / `Eq`: the shard cache is runtime state, two stores
@@ -47,7 +58,11 @@ impl Eq for StoreDir {}
 
 impl From<PathBuf> for StoreDir {
     fn from(root: PathBuf) -> Self {
-        StoreDir { root, ensured_shards: DashSet::new() }
+        StoreDir {
+            root,
+            ensured_shards: DashSet::new(),
+            cached_files_dir: OnceLock::new(),
+        }
     }
 }
 
@@ -83,7 +98,15 @@ impl StoreDir {
 
     /// The directory that contains all content-addressed files.
     fn files(&self) -> PathBuf {
-        self.v11().join("files")
+        self.files_dir().to_path_buf()
+    }
+
+    /// Borrow the memoised `<root>/v11/files` path. The CAS write hot
+    /// path calls this per CAFS file written, so caching the joined
+    /// path saves one `PathBuf` allocation per call (~170k on the
+    /// alotta-files clean install).
+    fn files_dir(&self) -> &PathBuf {
+        self.cached_files_dir.get_or_init(|| self.v11().join("files"))
     }
 
     /// Path to a file in the store directory.
@@ -92,7 +115,7 @@ impl StoreDir {
     /// * `head` is the first 2 hexadecimal digit of the file address.
     /// * `tail` is the rest of the address and an optional suffix.
     fn file_path_by_head_tail(&self, head: &str, tail: &str) -> PathBuf {
-        self.files().join(head).join(tail)
+        self.files_dir().join(head).join(tail)
     }
 
     /// Path to a content-addressed file. The hex digest is split into a
