@@ -1,4 +1,4 @@
-use crate::{LinkFileError, link_file};
+use crate::{LinkFileError, import_into_fresh_target};
 use derive_more::{Display, Error};
 use miette::Diagnostic;
 use pacquet_config::PackageImportMethod;
@@ -205,7 +205,15 @@ fn populate_dir<Reporter: self::Reporter>(
     cas_paths
         .par_iter()
         .try_for_each(|(cleaned_entry, store_path)| {
-            link_file::<Reporter>(
+            // Targets are guaranteed fresh: `populate_dir` only runs
+            // against a freshly-mkdir'd `dir_path` (the caller in
+            // `import_indexed_dir` gates on the directory not existing,
+            // or staged it as a new sibling). Skipping the pre-flight
+            // `fs::metadata` saves one `stat` syscall per file — ~170k
+            // on the alotta-files fixture — without losing the
+            // no-op-on-existing-target contract that `link_file` exposes
+            // to other callers.
+            import_into_fresh_target::<Reporter>(
                 logged_methods,
                 import_method,
                 store_path,
