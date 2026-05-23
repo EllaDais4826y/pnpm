@@ -385,8 +385,12 @@ where
         // `lockfile.is_none()` (writable-lockfile path) skips the
         // gate entirely — fresh local resolution is already filtered
         // by the resolver's per-version gate (when pacquet's
-        // resolver lands).
-        if let Some(loaded_lockfile) = lockfile {
+        // resolver lands). `config.trust_lockfile` is the opt-out
+        // for environments where the install can treat the on-disk
+        // lockfile as already-trusted (see [#11860]).
+        //
+        // [#11860]: https://github.com/pnpm/pnpm/issues/11860
+        if let Some(loaded_lockfile) = lockfile.filter(|_| !config.trust_lockfile) {
             let derived_lockfile_path = lockfile_path
                 .map_or_else(|| workspace_root.join(Lockfile::FILE_NAME), Path::to_path_buf);
             let verifiers = build_resolution_verifiers(config, Arc::clone(&http_client_arc))

@@ -93,3 +93,63 @@ fn install_fails_under_huge_minimum_release_age() {
 
     drop((root, mock_instance));
 }
+
+/// `trustLockfile: true` short-circuits the verification gate so a
+/// lockfile that would otherwise trip the policy
+/// (`minimumReleaseAge: 100 years` rejects every published version)
+/// installs cleanly. Confirms the opt-out path runs end-to-end
+/// through the CLI and that no `MINIMUM_RELEASE_AGE_VIOLATION` error
+/// leaks into stderr.
+#[test]
+fn trust_lockfile_skips_verification() {
+    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    let manifest_path = workspace.join("package.json");
+    let package_json = serde_json::json!({
+        "dependencies": {
+            "@pnpm.e2e/hello-world-js-bin": "1.0.0",
+        },
+    });
+    fs::write(&manifest_path, package_json.to_string()).expect("write package.json");
+
+    // Same provocation as the gated test above: 100 years of
+    // minimumReleaseAge rejects every version the mocked registry
+    // serves. `trustLockfile: true` is the opt-out that makes the
+    // install ignore the gate entirely.
+    let workspace_yaml_path = workspace.join("pnpm-workspace.yaml");
+    let workspace_yaml = format!(
+        "{}\nminimumReleaseAge: {}\ntrustLockfile: true\n",
+        fs::read_to_string(&workspace_yaml_path).expect("read workspace yaml seed"),
+        60 * 24 * 365 * 100,
+    );
+    fs::write(&workspace_yaml_path, workspace_yaml).expect("write pnpm-workspace.yaml");
+
+    let lockfile = "lockfileVersion: '9.0'\n\
+        importers:\n  \
+          .:\n    \
+            dependencies:\n      \
+              '@pnpm.e2e/hello-world-js-bin':\n        \
+                specifier: 1.0.0\n        \
+                version: 1.0.0\n\
+        packages:\n  \
+          '@pnpm.e2e/hello-world-js-bin@1.0.0':\n    \
+            resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==}\n\
+        snapshots:\n  \
+          '@pnpm.e2e/hello-world-js-bin@1.0.0': {}\n";
+    fs::write(workspace.join("pnpm-lock.yaml"), lockfile).expect("write lockfile");
+
+    let output = pacquet
+        .with_args(["install", "--frozen-lockfile"])
+        .output()
+        .expect("spawn pacquet install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        !stderr.contains("ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION"),
+        "trustLockfile must skip the verification gate; got:\n{stderr}",
+    );
+
+    drop((root, mock_instance));
+}
