@@ -214,10 +214,7 @@ export function createNpmResolver (
   const fetch = pMemoize(fetchMetadataFromFromRegistry.bind(null, fetchOpts), {
     cacheKey: (...args) => JSON.stringify(args),
   })
-  const metaCache: PackageMetaCache = opts.metaCache ?? new LRUCache<string, PackageMeta>({
-    max: 10000,
-    ttl: 120 * 1000, // 2 minutes
-  })
+  const metaCache: PackageMetaCache = opts.metaCache ?? createDefaultPackageMetaCache()
   // Create peek function if storeDir is provided
   const storeDir = opts.storeDir
   const peekLockerForPeek = new Map<string, Promise<DependencyManifest | undefined>>()
@@ -1073,4 +1070,18 @@ function createVersionSpec (version: string, pinnedVersion?: PinnedVersion): str
     default:
       throw new PnpmError('BAD_PINNED_VERSION', `Cannot pin '${pinnedVersion ?? 'undefined'}'`)
   }
+}
+
+/**
+ * Construct the LRU `PackageMetaCache` instance the resolver uses by
+ * default. Exported so the install layer can build one cache and hand
+ * the same reference to both the resolver and the verifier — the
+ * verifier's fast path reads from it when the resolver has already
+ * fetched a packument during the same install.
+ */
+export function createDefaultPackageMetaCache (): PackageMetaCache {
+  return new LRUCache<string, PackageMeta>({
+    max: 10000,
+    ttl: 120 * 1000, // 2 minutes
+  })
 }

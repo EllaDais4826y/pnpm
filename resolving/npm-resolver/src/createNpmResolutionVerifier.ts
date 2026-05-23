@@ -18,6 +18,7 @@ import {
   type FetchFullMetadataCachedOptions,
 } from './fetchFullMetadataCached.js'
 import { BUILTIN_NAMED_REGISTRIES } from './parseBareSpecifier.js'
+import type { PackageMetaCache } from './pickPackage.js'
 import { getPkgMirrorPath, loadMeta, warnMissingTimeFieldOnce } from './pickPackage.js'
 import { failIfTrustDowngraded } from './trustChecks.js'
 import {
@@ -79,6 +80,16 @@ export interface CreateNpmResolutionVerifierOptions {
   fetchOpts: FetchMetadataFromFromRegistryOptions
   getAuthHeaderValueByURI: (registry: string) => string | undefined
   cacheDir?: FetchFullMetadataCachedOptions['cacheDir']
+  /**
+   * Per-install LRU shared with the npm resolver's `pickPackage`
+   * (`{ get, set }` over `PackageMeta`). When provided, the verifier
+   * consults it before fetching: a name the resolver already pulled
+   * during the same install yields the cached packument instead of a
+   * fresh disk/network round-trip. Optional — frozen-install paths and
+   * unit tests don't have a resolver running alongside, in which case
+   * the verifier falls back to its own fetch chain.
+   */
+  metaCache?: PackageMetaCache
   /** Overrides Date.now() for tests. */
   now?: number
 }
@@ -151,6 +162,7 @@ export function createNpmResolutionVerifier (
     getAuthHeaderValueByURI: opts.getAuthHeaderValueByURI,
     cacheDir: opts.cacheDir,
     cutoffMs: cutoff,
+    sharedMetaCache: opts.metaCache,
     abbreviatedMetaCache: new Map(),
     publishedAtCache: new Map(),
     localMetaCache: new Map(),
@@ -366,25 +378,35 @@ function fetchFullMetaForTrust (
   const cacheKey = `${registry}\x00${name}`
   let cachedPromise = context.fullMetaForTrustCache.get(cacheKey)
   if (cachedPromise == null) {
-    // Don't swallow the fetch rejection here — `runTrustCheck` catches it
-    // and surfaces the underlying message in the violation reason, which
-    // is more actionable than the generic "metadata is unavailable" the
-    // `!meta` fallback emits. The cache still holds the rejected promise
-    // so repeat verifier calls for the same (registry, name) within one
-    // install don't refetch a known-failing endpoint.
-    //
-    // The fetched packument is projected down to just the trust-relevant
-    // fields (per-version `_npmUser.trustedPublisher` and
-    // `dist.attestations.provenance`, plus the package-level `time` map)
-    // before being stored. The full document — dependency maps, scripts,
-    // READMEs for every version — would otherwise stay resident in this
-    // map for the entire install, which on multi-thousand-entry
-    // workspaces OOMs CI runners with a 2GB heap (see #11860).
-    cachedPromise = fetchFullMetadataCached(context.fetchOpts, name, {
-      registry,
-      authHeaderValue: context.getAuthHeaderValueByURI(registry),
-      cacheDir: context.cacheDir,
-    }).then(projectTrustMeta)
+    // Fast path: if the resolver already upgraded to full meta for this
+    // name during the same install (e.g. minimumReleaseAge active),
+    // reuse that document. Abbreviated meta is rejected here — it lacks
+    // per-version `time` and per-version trust evidence, both required
+    // by failIfTrustDowngraded.
+    const shared = context.sharedMetaCache?.get(`${name}:full`)
+    if (shared != null) {
+      cachedPromise = Promise.resolve(projectTrustMeta(shared))
+    } else {
+      // Don't swallow the fetch rejection here — `runTrustCheck` catches it
+      // and surfaces the underlying message in the violation reason, which
+      // is more actionable than the generic "metadata is unavailable" the
+      // `!meta` fallback emits. The cache still holds the rejected promise
+      // so repeat verifier calls for the same (registry, name) within one
+      // install don't refetch a known-failing endpoint.
+      //
+      // The fetched packument is projected down to just the trust-relevant
+      // fields (per-version `_npmUser.trustedPublisher` and
+      // `dist.attestations.provenance`, plus the package-level `time` map)
+      // before being stored. The full document — dependency maps, scripts,
+      // READMEs for every version — would otherwise stay resident in this
+      // map for the entire install, which on multi-thousand-entry
+      // workspaces OOMs CI runners with a 2GB heap (see #11860).
+      cachedPromise = fetchFullMetadataCached(context.fetchOpts, name, {
+        registry,
+        authHeaderValue: context.getAuthHeaderValueByURI(registry),
+        cacheDir: context.cacheDir,
+      }).then(projectTrustMeta)
+    }
     context.fullMetaForTrustCache.set(cacheKey, cachedPromise)
   }
   return cachedPromise
@@ -443,6 +465,17 @@ interface PublishedAtLookupContext {
    * version it contains is too.
    */
   cutoffMs: number
+  /**
+   * Resolver-owned LRU (per-install) keyed by `${name}` (abbreviated)
+   * or `${name}:full` (full meta). When the resolver has already
+   * fetched a package during this install, the verifier reuses that
+   * packument instead of re-paying the disk/network round-trip — the
+   * fresh-install path otherwise fetches every entry twice. Optional:
+   * the frozen-install path runs without a resolver and never
+   * populates this cache, so the verifier's own fetch chain still
+   * carries the cold case.
+   */
+  sharedMetaCache?: PackageMetaCache
   /**
    * Per-(registry+name) memo of the abbreviated metadata fetch.
    * Abbreviated is what the resolver populates by default, so on a
@@ -586,14 +619,39 @@ function fetchAbbreviatedMeta (
   const cacheKey = `${registry}\x00${name}`
   let cachedPromise = context.abbreviatedMetaCache.get(cacheKey)
   if (cachedPromise == null) {
-    cachedPromise = fetchAbbreviatedMetadataCached(context.fetchOpts, name, {
-      registry,
-      authHeaderValue: context.getAuthHeaderValueByURI(registry),
-      cacheDir: context.cacheDir,
-    }).then(projectAbbreviatedMeta, () => undefined)
+    // Fast path: the resolver's per-install LRU already holds this
+    // packument from its own pickPackage pass — abbreviated or full.
+    // Project it for the shortcut and skip the disk/network round-trip.
+    // Mismatch on `name` is the same risk the resolver carries today
+    // (its cache key omits the registry), so reuse is no less correct
+    // than the resolver's own get.
+    const shared = readSharedMeta(context.sharedMetaCache, name)
+    if (shared != null) {
+      cachedPromise = Promise.resolve(projectAbbreviatedMeta(shared))
+    } else {
+      cachedPromise = fetchAbbreviatedMetadataCached(context.fetchOpts, name, {
+        registry,
+        authHeaderValue: context.getAuthHeaderValueByURI(registry),
+        cacheDir: context.cacheDir,
+      }).then(projectAbbreviatedMeta, () => undefined)
+    }
     context.abbreviatedMetaCache.set(cacheKey, cachedPromise)
   }
   return cachedPromise
+}
+
+function readSharedMeta (
+  cache: PackageMetaCache | undefined,
+  name: string
+): PackageMeta | undefined {
+  if (cache == null) return undefined
+  // Prefer the full entry — a `name:full` hit subsumes the abbreviated
+  // hit (full meta carries every field the abbreviated form does, plus
+  // `time` and per-version trust evidence the trust check needs). The
+  // resolver only populates `name:full` when the install ran with
+  // `minimumReleaseAge` configured, otherwise the bare `name` key holds
+  // the abbreviated form.
+  return cache.get(`${name}:full`) ?? cache.get(name)
 }
 
 // Project the abbreviated packument down to the two fields the verifier
