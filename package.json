@@ -39,5 +39,11 @@
     "packages/config",
     "packages/core",
     "packages/cli"
-  ]
+  ],
+  "prettier": {
+    "semi": false,
+    "singleQuote": true,
+    "printWidth": 100,
+    "trailingComma": "es5"
+  }
 }
